@@ -11,6 +11,8 @@ dependencies = []
 
 [project.optional-dependencies]
 postgres = ["psycopg[binary]>=3.2,<4"]
+api = ["fastapi>=0.110,<1", "uvicorn[standard]>=0.29,<1"]
+test = ["httpx>=0.27,<1", "pytest>=8,<9"]
 
 [project.scripts]
 radar = "radar.cli:main"

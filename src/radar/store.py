@@ -63,6 +63,12 @@ CREATE TABLE IF NOT EXISTS trend_scores (
     calculated_at TEXT NOT NULL,
     PRIMARY KEY (repository_id, score_date, algorithm_version)
 );
+
+CREATE INDEX IF NOT EXISTS idx_trend_scores_date_score
+    ON trend_scores (score_date, total_score DESC);
+
+CREATE INDEX IF NOT EXISTS idx_snapshots_repository_date
+    ON repository_snapshots (repository_id, snapshot_date DESC);
 """
 
 POSTGRES_SCHEMA = files("radar.migrations").joinpath("001_initial.sql").read_text(encoding="utf-8")
@@ -85,7 +91,49 @@ class Snapshot:
     contributor_count_approx: int | None = None
 
 
+@dataclass(frozen=True)
+class RepositoryRecord:
+    repository_id: int
+    full_name: str
+    url: str
+    description: str | None
+    primary_language: str | None
+    created_at: str
+    pushed_at: str | None
+    archived: bool
+    is_fork: bool
+    discovered_at: str
+    discovery_source: str
+
+
+@dataclass(frozen=True)
+class TrendScoreRecord:
+    repository_id: int
+    score_date: date
+    algorithm_version: str
+    total_score: float | None
+    star_velocity_score: float | None
+    acceleration_score: float | None
+    activity_score: float | None
+    freshness_score: float | None
+    quality_score: float | None
+    reasons: dict[str, Any]
+    calculated_at: str
+
+
+@dataclass(frozen=True)
+class TrendingItem:
+    repository: RepositoryRecord
+    score: TrendScoreRecord
+
+
 class SnapshotStoreProtocol(Protocol):
+    def initialize(self) -> None:
+        """Create or migrate the backing schema."""
+
+    def counts(self) -> tuple[int, int]:
+        """Return repository and snapshot counts for health checks."""
+
     def save_repository(self, repository: dict[str, Any], source: str, snapshot_day: date) -> None:
         """Persist repository metadata and its snapshot for a day."""
 
@@ -100,6 +148,28 @@ class SnapshotStoreProtocol(Protocol):
         limit: int = 8,
     ) -> list[Snapshot]:
         """Return recent snapshots in ascending date order."""
+
+    def get_repository(self, repository_id: int) -> RepositoryRecord | None:
+        """Return repository metadata, if it exists."""
+
+    def list_trending(
+        self,
+        score_date: date,
+        *,
+        algorithm_version: str | None = None,
+        limit: int = 20,
+        include_warming_up: bool = False,
+    ) -> list[TrendingItem]:
+        """Return score rows joined with repository metadata."""
+
+    def get_trend_score(
+        self,
+        repository_id: int,
+        score_date: date,
+        *,
+        algorithm_version: str | None = None,
+    ) -> TrendScoreRecord | None:
+        """Return one score for a repository and day."""
 
     def save_trend_score(self, score: "TrendScore") -> None:
         """Persist one versioned score for a repository and day."""
@@ -221,6 +291,63 @@ class SnapshotStore:
             rows = connection.execute(query, parameters).fetchall()
         return [_snapshot_from_row(row) for row in reversed(rows)]
 
+    def get_repository(self, repository_id: int) -> RepositoryRecord | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id AS repository_id, full_name, url, description,
+                       primary_language, created_at, pushed_at, archived,
+                       is_fork, discovered_at, discovery_source
+                FROM repositories
+                WHERE id = ?
+                """,
+                (repository_id,),
+            ).fetchone()
+        return _repository_from_row(row) if row is not None else None
+
+    def list_trending(
+        self,
+        score_date: date,
+        *,
+        algorithm_version: str | None = None,
+        limit: int = 20,
+        include_warming_up: bool = False,
+    ) -> list[TrendingItem]:
+        _validate_query_limit(limit)
+        query = _trending_query("?", include_warming_up=include_warming_up)
+        parameters: list[Any] = [score_date.isoformat()]
+        if algorithm_version is not None:
+            query += " AND t.algorithm_version = ?"
+            parameters.append(algorithm_version)
+        query += " ORDER BY (t.total_score IS NULL), t.total_score DESC, r.full_name LIMIT ?"
+        parameters.append(limit)
+        with self.connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [_trending_item_from_row(row) for row in rows]
+
+    def get_trend_score(
+        self,
+        repository_id: int,
+        score_date: date,
+        *,
+        algorithm_version: str | None = None,
+    ) -> TrendScoreRecord | None:
+        query = """
+            SELECT repository_id, score_date, algorithm_version, total_score,
+                   star_velocity_score, acceleration_score, activity_score,
+                   freshness_score, quality_score, reasons_json, calculated_at
+            FROM trend_scores
+            WHERE repository_id = ? AND score_date = ?
+        """
+        parameters: list[Any] = [repository_id, score_date.isoformat()]
+        if algorithm_version is not None:
+            query += " AND algorithm_version = ?"
+            parameters.append(algorithm_version)
+        query += " ORDER BY calculated_at DESC LIMIT 1"
+        with self.connect() as connection:
+            row = connection.execute(query, parameters).fetchone()
+        return _trend_score_from_row(row) if row is not None else None
+
     def save_trend_score(self, score: "TrendScore") -> None:
         with self.connect() as connection:
             connection.execute(
@@ -270,6 +397,116 @@ def _optional_int(value: Any) -> int | None:
 def _validate_history_limit(limit: int) -> None:
     if not 1 <= limit <= 366:
         raise ValueError("history limit must be between 1 and 366")
+
+
+def _validate_query_limit(limit: int) -> None:
+    if not 1 <= limit <= 100:
+        raise ValueError("query limit must be between 1 and 100")
+
+
+def _row_value(row: Any, key: str, index: int) -> Any:
+    try:
+        return row[key]
+    except (IndexError, KeyError, TypeError):
+        return row[index]
+
+
+def _iso_timestamp(value: Any) -> str:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
+
+
+def _repository_from_row(row: Any, *, index_offset: int = 0) -> RepositoryRecord:
+    return RepositoryRecord(
+        repository_id=int(_row_value(row, "repository_id", index_offset)),
+        full_name=str(_row_value(row, "full_name", index_offset + 1)),
+        url=str(_row_value(row, "url", index_offset + 2)),
+        description=_row_value(row, "description", index_offset + 3),
+        primary_language=_row_value(row, "primary_language", index_offset + 4),
+        created_at=_iso_timestamp(_row_value(row, "created_at", index_offset + 5)),
+        pushed_at=(
+            None
+            if _row_value(row, "pushed_at", index_offset + 6) is None
+            else _iso_timestamp(_row_value(row, "pushed_at", index_offset + 6))
+        ),
+        archived=bool(_row_value(row, "archived", index_offset + 7)),
+        is_fork=bool(_row_value(row, "is_fork", index_offset + 8)),
+        discovered_at=_iso_timestamp(_row_value(row, "discovered_at", index_offset + 9)),
+        discovery_source=str(_row_value(row, "discovery_source", index_offset + 10)),
+    )
+
+
+def _parse_reasons(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    parsed = json.loads(value)
+    if not isinstance(parsed, dict):
+        raise ValueError("trend score reasons must be a JSON object")
+    return parsed
+
+
+def _score_date(value: Any) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value))
+
+
+def _trend_score_from_row(row: Any, *, index_offset: int = 0, prefix: str = "") -> TrendScoreRecord:
+    def value(name: str, offset: int) -> Any:
+        return _row_value(row, f"{prefix}{name}", index_offset + offset)
+
+    return TrendScoreRecord(
+        repository_id=int(value("repository_id", 0)),
+        score_date=_score_date(value("score_date", 1)),
+        algorithm_version=str(value("algorithm_version", 2)),
+        total_score=_optional_float(value("total_score", 3)),
+        star_velocity_score=_optional_float(value("star_velocity_score", 4)),
+        acceleration_score=_optional_float(value("acceleration_score", 5)),
+        activity_score=_optional_float(value("activity_score", 6)),
+        freshness_score=_optional_float(value("freshness_score", 7)),
+        quality_score=_optional_float(value("quality_score", 8)),
+        reasons=_parse_reasons(value("reasons_json", 9)),
+        calculated_at=_iso_timestamp(value("calculated_at", 10)),
+    )
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    return float(value)
+
+
+def _trending_query(placeholder: str, *, include_warming_up: bool) -> str:
+    warming_filter = "" if include_warming_up else " AND t.total_score IS NOT NULL"
+    return f"""
+        SELECT
+            r.id AS repository_id, r.full_name, r.url, r.description,
+            r.primary_language, r.created_at, r.pushed_at, r.archived,
+            r.is_fork, r.discovered_at, r.discovery_source,
+            t.repository_id AS score_repository_id, t.score_date AS score_date,
+            t.algorithm_version AS score_algorithm_version,
+            t.total_score AS score_total_score,
+            t.star_velocity_score AS score_star_velocity_score,
+            t.acceleration_score AS score_acceleration_score,
+            t.activity_score AS score_activity_score,
+            t.freshness_score AS score_freshness_score,
+            t.quality_score AS score_quality_score,
+            t.reasons_json AS score_reasons_json,
+            t.calculated_at AS score_calculated_at
+        FROM repositories r
+        JOIN trend_scores t ON t.repository_id = r.id
+        WHERE t.score_date = {placeholder}{warming_filter}
+    """
+
+
+def _trending_item_from_row(row: Any) -> TrendingItem:
+    return TrendingItem(
+        repository=_repository_from_row(row),
+        score=_trend_score_from_row(row, index_offset=11, prefix="score_"),
+    )
 
 
 def _snapshot_from_row(row: Any) -> Snapshot:
@@ -469,6 +706,63 @@ class PostgresSnapshotStore:
         with self.connect() as connection:
             rows = connection.execute(query, parameters).fetchall()
         return [_snapshot_from_values(row) for row in reversed(rows)]
+
+    def get_repository(self, repository_id: int) -> RepositoryRecord | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id AS repository_id, full_name, url, description,
+                       primary_language, created_at, pushed_at, archived,
+                       is_fork, discovered_at, discovery_source
+                FROM repositories
+                WHERE id = %s
+                """,
+                (repository_id,),
+            ).fetchone()
+        return _repository_from_row(row) if row is not None else None
+
+    def list_trending(
+        self,
+        score_date: date,
+        *,
+        algorithm_version: str | None = None,
+        limit: int = 20,
+        include_warming_up: bool = False,
+    ) -> list[TrendingItem]:
+        _validate_query_limit(limit)
+        query = _trending_query("%s", include_warming_up=include_warming_up)
+        parameters: list[Any] = [score_date]
+        if algorithm_version is not None:
+            query += " AND t.algorithm_version = %s"
+            parameters.append(algorithm_version)
+        query += " ORDER BY t.total_score DESC NULLS LAST, r.full_name LIMIT %s"
+        parameters.append(limit)
+        with self.connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [_trending_item_from_row(row) for row in rows]
+
+    def get_trend_score(
+        self,
+        repository_id: int,
+        score_date: date,
+        *,
+        algorithm_version: str | None = None,
+    ) -> TrendScoreRecord | None:
+        query = """
+            SELECT repository_id, score_date, algorithm_version, total_score,
+                   star_velocity_score, acceleration_score, activity_score,
+                   freshness_score, quality_score, reasons_json, calculated_at
+            FROM trend_scores
+            WHERE repository_id = %s AND score_date = %s
+        """
+        parameters: list[Any] = [repository_id, score_date]
+        if algorithm_version is not None:
+            query += " AND algorithm_version = %s"
+            parameters.append(algorithm_version)
+        query += " ORDER BY calculated_at DESC LIMIT 1"
+        with self.connect() as connection:
+            row = connection.execute(query, parameters).fetchone()
+        return _trend_score_from_row(row) if row is not None else None
 
     def save_trend_score(self, score: "TrendScore") -> None:
         with self.connect() as connection:

@@ -21,3 +21,9 @@ CREATE TABLE IF NOT EXISTS trend_scores (
     calculated_at TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (repository_id, score_date, algorithm_version)
 );
+
+CREATE INDEX IF NOT EXISTS idx_trend_scores_date_score
+    ON trend_scores (score_date, total_score DESC);
+
+CREATE INDEX IF NOT EXISTS idx_snapshots_repository_date
+    ON repository_snapshots (repository_id, snapshot_date DESC);

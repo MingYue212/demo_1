@@ -37,6 +37,15 @@ PostgreSQL schema 位于 `src/radar/migrations/001_initial.sql` 和 `002_trend_s
 
 `radar score` 使用最近最多 8 个快照计算确定性的 7 日 star velocity、acceleration、数据新鲜度和数据完整度；不足 7 日历史的项目会保留为 `warming_up`，不会伪造正式分数。commit、release 和 contributor 信号存在时会自动加入，否则会在 `reasons` 中标明缺失并重新归一化权重。
 
+只读查询 API 可以复用同一个 SQLite 或 PostgreSQL 数据库。安装 API 依赖并启动服务：
+
+```bash
+python -m pip install -e '.[api]'
+uvicorn radar.api:app --host 127.0.0.1 --port 8000
+```
+
+API 提供 `GET /health`、`GET /trending`、`GET /repositories/{id}`、`GET /repositories/{id}/history` 和 `GET /repositories/{id}/score`。`/trending` 默认读取当天的 `trend-v0.1` 分数，可用 `score_date`、`algorithm_version`、`limit` 和 `include_warming_up` 参数进行确定性查询；完整 OpenAPI 文档位于 `/docs`。
+
 如果没有配置 `RADAR_DATABASE_URL`，定时工作流会把单次 SQLite 结果保留为 14 天 artifact，用于验证字段、配额和任务耗时；artifact **不是** V0.1 的持久数据库。
 
 ## 测试
