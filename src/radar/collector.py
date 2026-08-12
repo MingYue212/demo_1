@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import date
 
 from radar.github import GitHubClient
-from radar.store import SnapshotStore
+from radar.store import SnapshotStoreProtocol
 
 
 DEFAULT_QUERIES = (
@@ -27,7 +27,7 @@ class CollectionResult:
 
 def collect(
     client: GitHubClient,
-    store: SnapshotStore,
+    store: SnapshotStoreProtocol,
     *,
     queries: tuple[str, ...] = DEFAULT_QUERIES,
     snapshot_day: date | None = None,

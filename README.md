@@ -24,7 +24,17 @@ radar collect --database radar.db --per-query 25
 
 同一天重复执行会更新而不是复制快照。使用 `--date YYYY-MM-DD` 可以执行确定性的回填，使用多个 `--query` 可以覆盖默认候选查询。
 
-定时工作流当前会把单次 SQLite 结果保留为 14 天 artifact，用于验证字段、配额和任务耗时；artifact **不是** V0.1 的持久数据库。完成 spike 后应把相同的存储接口接到 PostgreSQL，再开始计算跨日趋势。
+SQLite 是本地和 CI 的 fallback。接入托管 PostgreSQL（例如 Supabase）时，先安装可选依赖，再通过环境变量切换后端：
+
+```bash
+python -m pip install -e '.[postgres]'
+export RADAR_DATABASE_URL='postgresql://user:password@host:5432/radar'
+radar collect --database-url "$RADAR_DATABASE_URL" --per-query 25
+```
+
+PostgreSQL schema 位于 `src/radar/migrations/001_initial.sql`，采集器不需要因为存储后端切换而改变。同一天重复执行会更新而不是复制快照；使用 `--date YYYY-MM-DD` 可以执行确定性的回填，使用多个 `--query` 可以覆盖默认候选查询。
+
+如果没有配置 `RADAR_DATABASE_URL`，定时工作流会把单次 SQLite 结果保留为 14 天 artifact，用于验证字段、配额和任务耗时；artifact **不是** V0.1 的持久数据库。配置 PostgreSQL 后，下一步才是基于连续快照计算跨日趋势。
 
 ## 测试
 

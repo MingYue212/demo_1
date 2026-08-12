@@ -27,14 +27,29 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - run: python -m pip install .
+      - name: Install collector
+        env:
+          RADAR_DATABASE_URL: ${{ secrets.RADAR_DATABASE_URL }}
+        run: |
+          if [ -n "${RADAR_DATABASE_URL:-}" ]; then
+            python -m pip install ".[postgres]"
+          else
+            python -m pip install .
+          fi
       - name: Collect snapshots
         env:
           GITHUB_TOKEN: ${{ secrets.RADAR_GITHUB_TOKEN }}
+          RADAR_DATABASE_URL: ${{ secrets.RADAR_DATABASE_URL }}
           PER_QUERY: ${{ inputs.per_query || '25' }}
-        run: radar collect --database radar.db --per-query "$PER_QUERY"
+        run: |
+          if [ -n "${RADAR_DATABASE_URL:-}" ]; then
+            radar collect --database-url "$RADAR_DATABASE_URL" --per-query "$PER_QUERY"
+          else
+            radar collect --database radar.db --per-query "$PER_QUERY"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: radar-snapshot-${{ github.run_id }}
           path: radar.db
           retention-days: 14
+          if-no-files-found: ignore

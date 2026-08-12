@@ -9,11 +9,17 @@ description = "Collect reproducible GitHub snapshots for AI Tech Radar"
 requires-python = ">=3.11"
 dependencies = []
 
+[project.optional-dependencies]
+postgres = ["psycopg[binary]>=3.2,<4"]
+
 [project.scripts]
 radar = "radar.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"radar.migrations" = ["*.sql"]
 
 [tool.pytest.ini_options]
 addopts = "-q"
