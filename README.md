@@ -20,6 +20,7 @@ python -m venv .venv
 python -m pip install -e .
 export GITHUB_TOKEN=your_token
 radar collect --database radar.db --per-query 25
+radar score --database radar.db --date 2026-08-12
 ```
 
 同一天重复执行会更新而不是复制快照。使用 `--date YYYY-MM-DD` 可以执行确定性的回填，使用多个 `--query` 可以覆盖默认候选查询。
@@ -32,9 +33,11 @@ export RADAR_DATABASE_URL='postgresql://user:password@host:5432/radar'
 radar collect --database-url "$RADAR_DATABASE_URL" --per-query 25
 ```
 
-PostgreSQL schema 位于 `src/radar/migrations/001_initial.sql`，采集器不需要因为存储后端切换而改变。同一天重复执行会更新而不是复制快照；使用 `--date YYYY-MM-DD` 可以执行确定性的回填，使用多个 `--query` 可以覆盖默认候选查询。
+PostgreSQL schema 位于 `src/radar/migrations/001_initial.sql` 和 `002_trend_scores.sql`，采集器和评分器不需要因为存储后端切换而改变。同一天重复执行会更新而不是复制快照；使用 `--date YYYY-MM-DD` 可以执行确定性的回填，使用多个 `--query` 可以覆盖默认候选查询。
 
-如果没有配置 `RADAR_DATABASE_URL`，定时工作流会把单次 SQLite 结果保留为 14 天 artifact，用于验证字段、配额和任务耗时；artifact **不是** V0.1 的持久数据库。配置 PostgreSQL 后，下一步才是基于连续快照计算跨日趋势。
+`radar score` 使用最近最多 8 个快照计算确定性的 7 日 star velocity、acceleration、数据新鲜度和数据完整度；不足 7 日历史的项目会保留为 `warming_up`，不会伪造正式分数。commit、release 和 contributor 信号存在时会自动加入，否则会在 `reasons` 中标明缺失并重新归一化权重。
+
+如果没有配置 `RADAR_DATABASE_URL`，定时工作流会把单次 SQLite 结果保留为 14 天 artifact，用于验证字段、配额和任务耗时；artifact **不是** V0.1 的持久数据库。
 
 ## 测试
 

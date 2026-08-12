@@ -51,3 +51,17 @@ def test_second_day_creates_new_snapshot(tmp_path):
     collect(FakeClient(), store, queries=("one",), snapshot_day=date(2026, 8, 11))
 
     assert store.counts() == (1, 2)
+
+
+def test_snapshot_history_is_returned_in_ascending_order(tmp_path):
+    store = SnapshotStore(tmp_path / "radar.db")
+    store.initialize()
+    collect(FakeClient(), store, queries=("one",), snapshot_day=date(2026, 8, 10))
+    collect(FakeClient(), store, queries=("one",), snapshot_day=date(2026, 8, 11))
+
+    history = store.snapshot_history(1, end_date=date(2026, 8, 11), limit=8)
+
+    assert [snapshot.snapshot_date for snapshot in history] == [
+        date(2026, 8, 10),
+        date(2026, 8, 11),
+    ]
