@@ -1,10 +1,12 @@
 name: Test
 
 on:
+  # push 和 pull request 都执行同一套回归测试。
   push:
   pull_request:
 
 permissions:
+  # 测试工作流不需要写入仓库或发布权限。
   contents: read
 
 jobs:
@@ -12,10 +14,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      # CI 安装 API 和测试 extra，确保 FastAPI fixture 与本地一致。
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
       - run: python -m pip install '.[api,test]'
+      # pytest 会执行采集、GitHub 客户端、存储、评分和 API 测试。
       - run: pytest

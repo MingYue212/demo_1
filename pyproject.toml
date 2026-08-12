@@ -1,8 +1,10 @@
 [build-system]
+# 使用 setuptools 从 src 布局构建可编辑安装包。
 requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [project]
+# 基础依赖保持为空，采集和 SQLite 评分可直接使用 Python 标准库。
 name = "ai-tech-radar"
 version = "0.1.0"
 description = "Collect reproducible GitHub snapshots for AI Tech Radar"
@@ -10,11 +12,15 @@ requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]
+# 生产持久化后端：仅在配置 RADAR_DATABASE_URL 时安装。
 postgres = ["psycopg[binary]>=3.2,<4"]
+# HTTP 查询服务：FastAPI 负责路由，Uvicorn 负责 ASGI 运行。
 api = ["fastapi>=0.110,<1", "uvicorn[standard]>=0.29,<1"]
+# 测试工具和 TestClient 所需 HTTP 客户端，仅供开发/CI 使用。
 test = ["httpx>=0.27,<1", "pytest>=8,<9"]
 
 [project.scripts]
+# 安装后提供 radar collect / radar score 命令。
 radar = "radar.cli:main"
 
 [tool.setuptools.packages.find]

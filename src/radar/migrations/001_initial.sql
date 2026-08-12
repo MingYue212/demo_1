@@ -1,3 +1,4 @@
+-- 仓库基础元数据：按 GitHub repository ID 保持实体稳定。
 CREATE TABLE IF NOT EXISTS repositories (
     id BIGINT PRIMARY KEY,
     full_name TEXT NOT NULL UNIQUE,
@@ -12,6 +13,7 @@ CREATE TABLE IF NOT EXISTS repositories (
     discovery_source TEXT NOT NULL
 );
 
+-- 每个仓库每天一条快照，用复合主键保证重复采集幂等。
 CREATE TABLE IF NOT EXISTS repository_snapshots (
     repository_id BIGINT NOT NULL REFERENCES repositories(id),
     snapshot_date DATE NOT NULL,

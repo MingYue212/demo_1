@@ -1,3 +1,5 @@
+"""只读 FastAPI 路由的 SQLite fixture 集成测试。"""
+
 from datetime import date
 
 from fastapi.testclient import TestClient
@@ -11,6 +13,7 @@ SCORE_DATE = date(2026, 8, 8)
 
 
 def repository(repository_id: int, name: str) -> dict:
+    """构造 API fixture 使用的仓库元数据。"""
     return {
         "id": repository_id,
         "full_name": f"org/{name}",
@@ -25,6 +28,7 @@ def repository(repository_id: int, name: str) -> dict:
 
 
 def seed_store(tmp_path):
+    """写入线性、加速和 warming_up 三类项目并预先计算分数。"""
     store = SnapshotStore(tmp_path / "radar.db")
     store.initialize()
     histories = {
@@ -34,6 +38,7 @@ def seed_store(tmp_path):
     }
     for repository_id, (name, stars) in histories.items():
         for offset, star_count in enumerate(stars):
+            # 三类历史长度不同，用于同时验证正式分数和预热状态。
             store.save_repository(
                 {
                     **repository(repository_id, name),
@@ -45,14 +50,17 @@ def seed_store(tmp_path):
                 "fixture",
                 date(2026, 8, 1 + offset),
             )
+    # API 只读数据库，因此 fixture 需要先执行一次评分写入。
     score_store(store, score_date=SCORE_DATE)
     return store
 
 
 def test_read_only_api_exposes_health_trending_and_repository_views(tmp_path):
+    """健康、排名、详情、历史和单项目分数接口应返回稳定结构。"""
     store = seed_store(tmp_path)
     client = TestClient(create_app(store))
 
+    # 健康检查同时验证存储后端名称和 fixture 数量。
     health = client.get("/health")
     assert health.status_code == 200
     assert health.json() == {
@@ -105,6 +113,7 @@ def test_read_only_api_exposes_health_trending_and_repository_views(tmp_path):
 
 
 def test_trending_can_include_warming_up_and_returns_not_found(tmp_path):
+    """Trending 可选返回 warming_up 项目，未知仓库返回 404。"""
     store = seed_store(tmp_path)
     client = TestClient(create_app(store))
 
@@ -117,6 +126,7 @@ def test_trending_can_include_warming_up_and_returns_not_found(tmp_path):
         },
     )
     assert trending.status_code == 200
+    # include_warming_up=true 时，历史不足的项目也应出现在列表中。
     items = trending.json()["items"]
     warming = next(item for item in items if item["repository"]["repository_id"] == 3)
     assert warming["score"]["total_score"] is None

@@ -1,7 +1,7 @@
-"""SQLite and PostgreSQL persistence for repository snapshots.
+"""仓库快照、趋势分数和查询结果的 SQLite/PostgreSQL 持久化层。
 
-SQLite remains useful for local experiments; PostgreSQL is the persistent V0.1
-backend. Both stores expose the same small interface to the collector.
+SQLite 用于本地实验和 CI fallback；PostgreSQL 是 V0.1 的持久化后端。两个
+实现遵守同一套协议，让采集器、评分器和只读 API 不需要感知具体数据库。
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 
 
 SCHEMA = """
+-- 保存 GitHub 仓库的相对稳定元数据。
 CREATE TABLE IF NOT EXISTS repositories (
     id INTEGER PRIMARY KEY,
     full_name TEXT NOT NULL UNIQUE,
@@ -34,6 +35,7 @@ CREATE TABLE IF NOT EXISTS repositories (
     discovery_source TEXT NOT NULL
 );
 
+-- 每个仓库每天最多一条快照，主键同时提供幂等写入约束。
 CREATE TABLE IF NOT EXISTS repository_snapshots (
     repository_id INTEGER NOT NULL REFERENCES repositories(id),
     snapshot_date TEXT NOT NULL,
@@ -49,6 +51,7 @@ CREATE TABLE IF NOT EXISTS repository_snapshots (
     PRIMARY KEY (repository_id, snapshot_date)
 );
 
+-- 保存按算法版本区分的趋势分数，total_score 为空表示 warming_up。
 CREATE TABLE IF NOT EXISTS trend_scores (
     repository_id INTEGER NOT NULL REFERENCES repositories(id),
     score_date TEXT NOT NULL,
@@ -64,6 +67,7 @@ CREATE TABLE IF NOT EXISTS trend_scores (
     PRIMARY KEY (repository_id, score_date, algorithm_version)
 );
 
+-- API 按日期和分数排序时使用的索引。
 CREATE INDEX IF NOT EXISTS idx_trend_scores_date_score
     ON trend_scores (score_date, total_score DESC);
 
@@ -71,6 +75,7 @@ CREATE INDEX IF NOT EXISTS idx_snapshots_repository_date
     ON repository_snapshots (repository_id, snapshot_date DESC);
 """
 
+# PostgreSQL 使用打包在 migrations 目录中的 SQL，避免在 Python 中维护两份 schema。
 POSTGRES_SCHEMA = files("radar.migrations").joinpath("001_initial.sql").read_text(encoding="utf-8")
 POSTGRES_MIGRATIONS = (
     POSTGRES_SCHEMA,
@@ -80,6 +85,8 @@ POSTGRES_MIGRATIONS = (
 
 @dataclass(frozen=True)
 class Snapshot:
+    """某个仓库在某一天采集到的客观指标。"""
+
     repository_id: int
     snapshot_date: date
     stars: int
@@ -93,6 +100,8 @@ class Snapshot:
 
 @dataclass(frozen=True)
 class RepositoryRecord:
+    """供查询 API 返回的仓库元数据。"""
+
     repository_id: int
     full_name: str
     url: str
@@ -108,6 +117,8 @@ class RepositoryRecord:
 
 @dataclass(frozen=True)
 class TrendScoreRecord:
+    """从数据库读取的、可直接序列化为 API 响应的趋势分数。"""
+
     repository_id: int
     score_date: date
     algorithm_version: str
@@ -123,22 +134,26 @@ class TrendScoreRecord:
 
 @dataclass(frozen=True)
 class TrendingItem:
+    """一个仓库元数据和对应趋势分数的联结结果。"""
+
     repository: RepositoryRecord
     score: TrendScoreRecord
 
 
 class SnapshotStoreProtocol(Protocol):
+    """采集器、评分器和 API 共同依赖的最小存储协议。"""
+
     def initialize(self) -> None:
-        """Create or migrate the backing schema."""
+        """创建或迁移底层数据库 schema。"""
 
     def counts(self) -> tuple[int, int]:
-        """Return repository and snapshot counts for health checks."""
+        """返回仓库数和快照数，供健康检查使用。"""
 
     def save_repository(self, repository: dict[str, Any], source: str, snapshot_day: date) -> None:
-        """Persist repository metadata and its snapshot for a day."""
+        """保存仓库元数据，并写入指定日期的快照。"""
 
     def repository_ids(self) -> list[int]:
-        """Return repositories that can be scored."""
+        """返回可以参与评分的仓库 ID。"""
 
     def snapshot_history(
         self,
@@ -147,10 +162,10 @@ class SnapshotStoreProtocol(Protocol):
         end_date: date | None = None,
         limit: int = 8,
     ) -> list[Snapshot]:
-        """Return recent snapshots in ascending date order."""
+        """按日期升序返回最近快照。"""
 
     def get_repository(self, repository_id: int) -> RepositoryRecord | None:
-        """Return repository metadata, if it exists."""
+        """返回仓库元数据；仓库不存在时返回 None。"""
 
     def list_trending(
         self,
@@ -160,7 +175,7 @@ class SnapshotStoreProtocol(Protocol):
         limit: int = 20,
         include_warming_up: bool = False,
     ) -> list[TrendingItem]:
-        """Return score rows joined with repository metadata."""
+        """返回与仓库元数据联结后的趋势分数行。"""
 
     def get_trend_score(
         self,
@@ -169,22 +184,25 @@ class SnapshotStoreProtocol(Protocol):
         *,
         algorithm_version: str | None = None,
     ) -> TrendScoreRecord | None:
-        """Return one score for a repository and day."""
+        """返回指定仓库、日期和算法版本的分数。"""
 
     def save_trend_score(self, score: "TrendScore") -> None:
-        """Persist one versioned score for a repository and day."""
+        """保存指定仓库和算法版本的趋势分数。"""
 
 
 class SnapshotStore:
-    """SQLite snapshot store used by local runs and CI without a database."""
+    """用于本地运行和无数据库 CI 环境的 SQLite 存储实现。"""
 
     def __init__(self, path: str | Path) -> None:
+        """记录 SQLite 文件路径；真正的连接在每次操作时短暂创建。"""
         self.path = str(path)
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
+        """创建带外键约束的连接，并在离开上下文时提交和关闭。"""
         connection = sqlite3.connect(self.path)
         connection.row_factory = sqlite3.Row
+        # SQLite 默认不强制外键，显式打开以保证孤立快照不会被写入。
         connection.execute("PRAGMA foreign_keys = ON")
         try:
             yield connection
@@ -193,19 +211,24 @@ class SnapshotStore:
             connection.close()
 
     def initialize(self) -> None:
+        """创建当前 schema，并为旧 SQLite 文件补齐新增列。"""
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+            # 兼容 Trend Score 功能上线前已经存在的本地数据库。
             _ensure_sqlite_snapshot_columns(connection)
 
     def save_repository(self, repository: dict[str, Any], source: str, snapshot_day: date) -> None:
+        """幂等保存仓库元数据和指定日期的 GitHub 指标快照。"""
         required = {"id", "full_name", "html_url", "created_at"}
         missing = required.difference(repository)
         if missing:
             raise ValueError(f"repository is missing required fields: {', '.join(sorted(missing))}")
 
+        # 原始 payload 哈希用于审计同日数据是否发生变化。
         collected_at = datetime.now(timezone.utc).isoformat()
         payload_hash = _payload_hash(repository)
         with self.connect() as connection:
+            # 仓库元数据按 GitHub ID 更新，避免 full_name 改名时产生重复实体。
             connection.execute(
                 """
                 INSERT INTO repositories (
@@ -226,6 +249,7 @@ class SnapshotStore:
                     collected_at, source,
                 ),
             )
+            # 快照按 (repository_id, snapshot_date) 更新，保证重复采集幂等。
             connection.execute(
                 """
                 INSERT INTO repository_snapshots (
@@ -256,12 +280,14 @@ class SnapshotStore:
             )
 
     def counts(self) -> tuple[int, int]:
+        """返回当前数据库中的仓库数和快照数。"""
         with self.connect() as connection:
             repositories = connection.execute("SELECT count(*) FROM repositories").fetchone()[0]
             snapshots = connection.execute("SELECT count(*) FROM repository_snapshots").fetchone()[0]
         return repositories, snapshots
 
     def repository_ids(self) -> list[int]:
+        """按 ID 升序返回所有已发现仓库。"""
         with self.connect() as connection:
             rows = connection.execute("SELECT id FROM repositories ORDER BY id").fetchall()
         return [int(row[0]) for row in rows]
@@ -273,6 +299,7 @@ class SnapshotStore:
         end_date: date | None = None,
         limit: int = 8,
     ) -> list[Snapshot]:
+        """读取一个仓库的最近历史，并按日期升序返回。"""
         _validate_history_limit(limit)
         query = """
             SELECT repository_id, snapshot_date, stars, forks, open_issues,
@@ -283,15 +310,18 @@ class SnapshotStore:
         """
         parameters: list[Any] = [repository_id]
         if end_date is not None:
+            # 评分和 API 查询都不能读取评分日之后的未来数据。
             query += " AND snapshot_date <= ?"
             parameters.append(end_date.isoformat())
         query += " ORDER BY snapshot_date DESC LIMIT ?"
         parameters.append(limit)
         with self.connect() as connection:
             rows = connection.execute(query, parameters).fetchall()
+        # SQL 为了 LIMIT 使用降序，返回前翻转为时间序列自然顺序。
         return [_snapshot_from_row(row) for row in reversed(rows)]
 
     def get_repository(self, repository_id: int) -> RepositoryRecord | None:
+        """按 GitHub repository ID 查询元数据。"""
         with self.connect() as connection:
             row = connection.execute(
                 """
@@ -313,10 +343,12 @@ class SnapshotStore:
         limit: int = 20,
         include_warming_up: bool = False,
     ) -> list[TrendingItem]:
+        """按总分降序返回指定日期的 Trending 项目。"""
         _validate_query_limit(limit)
         query = _trending_query("?", include_warming_up=include_warming_up)
         parameters: list[Any] = [score_date.isoformat()]
         if algorithm_version is not None:
+            # 指定算法版本后只返回该版本，避免不同版本混排。
             query += " AND t.algorithm_version = ?"
             parameters.append(algorithm_version)
         query += " ORDER BY (t.total_score IS NULL), t.total_score DESC, r.full_name LIMIT ?"
@@ -332,6 +364,7 @@ class SnapshotStore:
         *,
         algorithm_version: str | None = None,
     ) -> TrendScoreRecord | None:
+        """读取单个仓库在指定日期的最新匹配分数。"""
         query = """
             SELECT repository_id, score_date, algorithm_version, total_score,
                    star_velocity_score, acceleration_score, activity_score,
@@ -349,6 +382,7 @@ class SnapshotStore:
         return _trend_score_from_row(row) if row is not None else None
 
     def save_trend_score(self, score: "TrendScore") -> None:
+        """幂等保存一条趋势分数及其可解释原因。"""
         with self.connect() as connection:
             connection.execute(
                 """
@@ -372,39 +406,47 @@ class SnapshotStore:
 
 
 def _payload_hash(payload: dict[str, Any]) -> str:
+    """对排序稳定的 JSON payload 计算 SHA-256 哈希。"""
     import hashlib
 
+    # separators 去掉无关空白，sort_keys 保证字段顺序不影响哈希。
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(canonical).hexdigest()
 
 
 def _ensure_sqlite_snapshot_columns(connection: sqlite3.Connection) -> None:
+    """为旧 SQLite 数据库补充 Trend Score 所需的可选指标列。"""
     columns = {
         row[1]
         for row in connection.execute("PRAGMA table_info(repository_snapshots)").fetchall()
     }
     for column in ("commit_count_30d", "release_count_30d", "contributor_count_approx"):
+        # SQLite 不支持在 ADD COLUMN 中使用 IF NOT EXISTS，因此先检查列清单。
         if column not in columns:
             connection.execute(f"ALTER TABLE repository_snapshots ADD COLUMN {column} INTEGER")
 
 
 def _optional_int(value: Any) -> int | None:
+    """把可选数值转换成整数，并保留 None。"""
     if value is None:
         return None
     return int(value)
 
 
 def _validate_history_limit(limit: int) -> None:
+    """校验历史查询上限，避免 API 或内部调用读取过大数据集。"""
     if not 1 <= limit <= 366:
         raise ValueError("history limit must be between 1 and 366")
 
 
 def _validate_query_limit(limit: int) -> None:
+    """校验 Trending 查询上限。"""
     if not 1 <= limit <= 100:
         raise ValueError("query limit must be between 1 and 100")
 
 
 def _row_value(row: Any, key: str, index: int) -> Any:
+    """兼容 SQLite 命名行和 psycopg 元组行的字段读取。"""
     try:
         return row[key]
     except (IndexError, KeyError, TypeError):
@@ -412,12 +454,14 @@ def _row_value(row: Any, key: str, index: int) -> Any:
 
 
 def _iso_timestamp(value: Any) -> str:
+    """把数据库返回的 datetime 或字符串统一为 ISO 文本。"""
     if isinstance(value, datetime):
         return value.isoformat()
     return str(value)
 
 
 def _repository_from_row(row: Any, *, index_offset: int = 0) -> RepositoryRecord:
+    """把仓库查询行转换为跨数据库一致的记录对象。"""
     return RepositoryRecord(
         repository_id=int(_row_value(row, "repository_id", index_offset)),
         full_name=str(_row_value(row, "full_name", index_offset + 1)),
@@ -438,6 +482,7 @@ def _repository_from_row(row: Any, *, index_offset: int = 0) -> RepositoryRecord
 
 
 def _parse_reasons(value: Any) -> dict[str, Any]:
+    """把 SQLite 文本或 PostgreSQL JSONB 转为原因字典。"""
     if isinstance(value, dict):
         return value
     parsed = json.loads(value)
@@ -447,6 +492,7 @@ def _parse_reasons(value: Any) -> dict[str, Any]:
 
 
 def _score_date(value: Any) -> date:
+    """兼容 PostgreSQL date/datetime 和 SQLite 字符串日期。"""
     if isinstance(value, datetime):
         return value.date()
     if isinstance(value, date):
@@ -455,7 +501,10 @@ def _score_date(value: Any) -> date:
 
 
 def _trend_score_from_row(row: Any, *, index_offset: int = 0, prefix: str = "") -> TrendScoreRecord:
+    """把趋势分数查询行转换为 API 可用的记录对象。"""
     def value(name: str, offset: int) -> Any:
+        """按字段别名或位置读取一列。"""
+        # 联结查询使用 score_ 前缀，单表查询则使用默认字段名。
         return _row_value(row, f"{prefix}{name}", index_offset + offset)
 
     return TrendScoreRecord(
@@ -474,12 +523,15 @@ def _trend_score_from_row(row: Any, *, index_offset: int = 0, prefix: str = "") 
 
 
 def _optional_float(value: Any) -> float | None:
+    """把数据库中的可选数值统一为浮点数。"""
     if value is None:
         return None
     return float(value)
 
 
 def _trending_query(placeholder: str, *, include_warming_up: bool) -> str:
+    """生成 SQLite 或 PostgreSQL 共享结构的 Trending 联结 SQL。"""
+    # 默认排除 total_score 为空的 warming_up 项目，API 可显式要求包含它们。
     warming_filter = "" if include_warming_up else " AND t.total_score IS NOT NULL"
     return f"""
         SELECT
@@ -503,6 +555,7 @@ def _trending_query(placeholder: str, *, include_warming_up: bool) -> str:
 
 
 def _trending_item_from_row(row: Any) -> TrendingItem:
+    """把仓库和分数联结行拆分为两个领域记录。"""
     return TrendingItem(
         repository=_repository_from_row(row),
         score=_trend_score_from_row(row, index_offset=11, prefix="score_"),
@@ -510,6 +563,7 @@ def _trending_item_from_row(row: Any) -> TrendingItem:
 
 
 def _snapshot_from_row(row: Any) -> Snapshot:
+    """把 SQLite 命名行转换为 Snapshot。"""
     return Snapshot(
         repository_id=int(row["repository_id"]),
         snapshot_date=date.fromisoformat(row["snapshot_date"]),
@@ -524,6 +578,7 @@ def _snapshot_from_row(row: Any) -> Snapshot:
 
 
 def _snapshot_from_values(values: Any) -> Snapshot:
+    """把 PostgreSQL 位置行转换为 Snapshot。"""
     snapshot_date = values[1]
     if isinstance(snapshot_date, str):
         snapshot_date = date.fromisoformat(snapshot_date)
@@ -541,6 +596,7 @@ def _snapshot_from_values(values: Any) -> Snapshot:
 
 
 def _trend_score_values(score: "TrendScore", *, calculated_at: Any) -> tuple[Any, ...]:
+    """按两个数据库的写入顺序准备趋势分数参数。"""
     return (
         score.repository_id,
         score.score_date.isoformat(),
@@ -560,6 +616,7 @@ PostgresConnectionFactory = Callable[[str], Any]
 
 
 def _default_postgres_connection(dsn: str) -> Any:
+    """创建默认 psycopg 连接；导入延迟到真正使用 PostgreSQL 时。"""
     try:
         import psycopg
     except ImportError as error:
@@ -570,19 +627,21 @@ def _default_postgres_connection(dsn: str) -> Any:
 
 
 def _github_timestamp(value: Any) -> datetime | None:
+    """把 GitHub 的 ISO-8601 时间转换为带时区的 datetime。"""
     if value is None:
         return None
     if isinstance(value, datetime):
         return value
     if not isinstance(value, str):
         raise ValueError("GitHub timestamp must be an ISO-8601 string")
+    # Python fromisoformat 需要显式的 UTC 偏移，而 GitHub 常返回 Z 后缀。
     normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
     parsed = datetime.fromisoformat(normalized)
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
 class PostgresSnapshotStore:
-    """PostgreSQL snapshot store with the same contract as :class:`SnapshotStore`."""
+    """遵守 SnapshotStoreProtocol 的 PostgreSQL 持久化实现。"""
 
     def __init__(
         self,
@@ -590,6 +649,7 @@ class PostgresSnapshotStore:
         *,
         connection_factory: PostgresConnectionFactory | None = None,
     ) -> None:
+        """保存 DSN 和可替换连接工厂，便于测试而不要求真实数据库。"""
         if not dsn.strip():
             raise ValueError("PostgreSQL database URL cannot be empty")
         self.dsn = dsn
@@ -597,22 +657,27 @@ class PostgresSnapshotStore:
 
     @contextmanager
     def connect(self) -> Iterator[Any]:
+        """创建一次 PostgreSQL 连接，并统一处理提交、回滚和关闭。"""
         connection = self.connection_factory(self.dsn)
         try:
             yield connection
             connection.commit()
         except Exception:
+            # 任何 SQL 异常都必须回滚，否则连接无法安全复用或关闭。
             connection.rollback()
             raise
         finally:
             connection.close()
 
     def initialize(self) -> None:
+        """按顺序执行基础 schema 和趋势分数 migration。"""
         with self.connect() as connection:
             for migration in POSTGRES_MIGRATIONS:
+                # migration 文件本身使用 IF NOT EXISTS，可重复执行。
                 connection.execute(migration)
 
     def save_repository(self, repository: dict[str, Any], source: str, snapshot_day: date) -> None:
+        """使用 PostgreSQL 类型写入仓库元数据和每日快照。"""
         required = {"id", "full_name", "html_url", "created_at"}
         missing = required.difference(repository)
         if missing:
@@ -621,6 +686,7 @@ class PostgresSnapshotStore:
         collected_at = datetime.now(timezone.utc)
         payload_hash = _payload_hash(repository)
         with self.connect() as connection:
+            # PostgreSQL 使用 %s 占位符，并把 GitHub 时间转为 TIMESTAMPTZ。
             connection.execute(
                 """
                 INSERT INTO repositories (
@@ -642,6 +708,7 @@ class PostgresSnapshotStore:
                     collected_at, source,
                 ),
             )
+            # 复合主键使同日重跑安全地更新原记录。
             connection.execute(
                 """
                 INSERT INTO repository_snapshots (
@@ -672,12 +739,14 @@ class PostgresSnapshotStore:
             )
 
     def counts(self) -> tuple[int, int]:
+        """返回 PostgreSQL 中的仓库数和快照数。"""
         with self.connect() as connection:
             repositories = connection.execute("SELECT count(*) FROM repositories").fetchone()[0]
             snapshots = connection.execute("SELECT count(*) FROM repository_snapshots").fetchone()[0]
         return repositories, snapshots
 
     def repository_ids(self) -> list[int]:
+        """按 ID 升序返回所有仓库。"""
         with self.connect() as connection:
             rows = connection.execute("SELECT id FROM repositories ORDER BY id").fetchall()
         return [int(row[0]) for row in rows]
@@ -689,6 +758,7 @@ class PostgresSnapshotStore:
         end_date: date | None = None,
         limit: int = 8,
     ) -> list[Snapshot]:
+        """读取评分日之前的最近快照，并按日期升序返回。"""
         _validate_history_limit(limit)
         query = """
             SELECT repository_id, snapshot_date, stars, forks, open_issues,
@@ -699,15 +769,18 @@ class PostgresSnapshotStore:
         """
         parameters: list[Any] = [repository_id]
         if end_date is not None:
+            # 使用 date 参数而不是字符串，让 psycopg 保持数据库类型语义。
             query += " AND snapshot_date <= %s"
             parameters.append(end_date)
         query += " ORDER BY snapshot_date DESC LIMIT %s"
         parameters.append(limit)
         with self.connect() as connection:
             rows = connection.execute(query, parameters).fetchall()
+        # 查询使用倒序和 LIMIT，返回前恢复时间升序。
         return [_snapshot_from_values(row) for row in reversed(rows)]
 
     def get_repository(self, repository_id: int) -> RepositoryRecord | None:
+        """按 GitHub repository ID 查询 PostgreSQL 元数据。"""
         with self.connect() as connection:
             row = connection.execute(
                 """
@@ -729,10 +802,12 @@ class PostgresSnapshotStore:
         limit: int = 20,
         include_warming_up: bool = False,
     ) -> list[TrendingItem]:
+        """执行 PostgreSQL Trending 联结查询，并按分数降序返回。"""
         _validate_query_limit(limit)
         query = _trending_query("%s", include_warming_up=include_warming_up)
         parameters: list[Any] = [score_date]
         if algorithm_version is not None:
+            # 算法版本作为可选过滤器，避免同一天多个版本混排。
             query += " AND t.algorithm_version = %s"
             parameters.append(algorithm_version)
         query += " ORDER BY t.total_score DESC NULLS LAST, r.full_name LIMIT %s"
@@ -748,6 +823,7 @@ class PostgresSnapshotStore:
         *,
         algorithm_version: str | None = None,
     ) -> TrendScoreRecord | None:
+        """查询指定仓库、日期和算法版本的单条分数。"""
         query = """
             SELECT repository_id, score_date, algorithm_version, total_score,
                    star_velocity_score, acceleration_score, activity_score,
@@ -765,6 +841,7 @@ class PostgresSnapshotStore:
         return _trend_score_from_row(row) if row is not None else None
 
     def save_trend_score(self, score: "TrendScore") -> None:
+        """把趋势分数和 JSONB reasons 幂等写入 PostgreSQL。"""
         with self.connect() as connection:
             connection.execute(
                 """

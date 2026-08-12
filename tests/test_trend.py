@@ -1,3 +1,5 @@
+"""趋势评分的预热、排名、缺失信号和幂等持久化测试。"""
+
 from datetime import date, datetime, timezone
 
 from radar.store import Snapshot, SnapshotStore
@@ -5,6 +7,7 @@ from radar.trend import score_histories, score_store
 
 
 def snapshots(repository_id, stars, *, optional=False):
+    """按连续日期构造可控的仓库快照序列。"""
     result = []
     for offset, star_count in enumerate(stars):
         result.append(
@@ -24,6 +27,7 @@ def snapshots(repository_id, stars, *, optional=False):
 
 
 def test_score_requires_a_seven_day_history():
+    """少于 7 天历史时应返回 warming_up 而不是正式分数。"""
     scores = score_histories(
         {1: snapshots(1, [1, 2, 3, 4, 5, 6])},
         score_date=date(2026, 8, 6),
@@ -36,6 +40,7 @@ def test_score_requires_a_seven_day_history():
 
 
 def test_accelerating_repository_ranks_above_linear_repository():
+    """增长加速的项目应高于线性增长项目。"""
     scores = score_histories(
         {
             1: snapshots(1, [0, 1, 2, 3, 4, 5, 6, 7]),
@@ -45,6 +50,7 @@ def test_accelerating_repository_ranks_above_linear_repository():
         calculated_at=datetime(2026, 8, 8, tzinfo=timezone.utc),
     )
 
+    # 通过 ID 建索引，分别检查两个项目的分数和解释信息。
     by_repository = {score.repository_id: score for score in scores}
     assert by_repository[1].total_score is not None
     assert by_repository[2].total_score is not None
@@ -54,6 +60,7 @@ def test_accelerating_repository_ranks_above_linear_repository():
 
 
 def test_missing_optional_signals_are_reported_without_blocking_a_score():
+    """可选活动信号缺失时仍应评分，并在 reasons 中明确标记。"""
     scores = score_histories(
         {1: snapshots(1, [0, 1, 2, 3, 4, 5, 6, 7])},
         score_date=date(2026, 8, 8),
@@ -67,6 +74,7 @@ def test_missing_optional_signals_are_reported_without_blocking_a_score():
 
 
 def test_score_store_reads_history_and_persists_idempotently(tmp_path):
+    """评分器应读取存储历史，并重复执行时只保留一条版本化记录。"""
     store = SnapshotStore(tmp_path / "radar.db")
     store.initialize()
     repository = {
@@ -84,6 +92,7 @@ def test_score_store_reads_history_and_persists_idempotently(tmp_path):
             date(2026, 8, 1 + offset),
         )
 
+    # 两次评分使用同一日期和默认算法版本，验证复合主键 upsert。
     first = score_store(store, score_date=date(2026, 8, 8))
     second = score_store(store, score_date=date(2026, 8, 8))
 
