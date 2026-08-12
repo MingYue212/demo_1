@@ -1,0 +1,72 @@
+name: Collect GitHub snapshots
+
+on:
+  # 每天错峰执行一次；workflow_dispatch 允许手动回填或验证采集。
+  schedule:
+    - cron: "23 2 * * *"
+  workflow_dispatch:
+    inputs:
+      per_query:
+        description: Repositories returned per discovery query
+        default: "25"
+        required: true
+
+permissions:
+  # 采集只需要读取代码仓库，不申请额外写权限。
+  contents: read
+
+concurrency:
+  # 防止上一次采集尚未结束时又启动第二个写入任务。
+  group: github-snapshot-collection
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # 使用固定的官方 Action，保证运行环境和 Python 版本可复现。
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install collector
+        env:
+          RADAR_DATABASE_URL: ${{ secrets.RADAR_DATABASE_URL }}
+        run: |
+          # 配置 PostgreSQL 时安装 psycopg，否则使用无第三方依赖的 SQLite fallback。
+          if [ -n "${RADAR_DATABASE_URL:-}" ]; then
+            python -m pip install ".[postgres]"
+          else
+            python -m pip install .
+          fi
+      - name: Collect snapshots
+        env:
+          GITHUB_TOKEN: ${{ secrets.RADAR_GITHUB_TOKEN }}
+          RADAR_DATABASE_URL: ${{ secrets.RADAR_DATABASE_URL }}
+          PER_QUERY: ${{ inputs.per_query || '25' }}
+        run: |
+          # 采集器和评分器使用同一数据库，确保排名基于刚写入的快照。
+          if [ -n "${RADAR_DATABASE_URL:-}" ]; then
+            radar collect --database-url "$RADAR_DATABASE_URL" --per-query "$PER_QUERY"
+          else
+            radar collect --database radar.db --per-query "$PER_QUERY"
+          fi
+      - name: Calculate trend scores
+        env:
+          RADAR_DATABASE_URL: ${{ secrets.RADAR_DATABASE_URL }}
+        run: |
+          # 评分结果写入 trend_scores；SQLite 文件只作为无持久库时的 artifact。
+          if [ -n "${RADAR_DATABASE_URL:-}" ]; then
+            radar score --database-url "$RADAR_DATABASE_URL"
+          else
+            radar score --database radar.db
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          # 仅在 SQLite fallback 存在时上传，保留 14 天供 Sprint 0 检查。
+          name: radar-snapshot-${{ github.run_id }}
+          path: radar.db
+          retention-days: 14
+          if-no-files-found: ignore
